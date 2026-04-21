@@ -40,6 +40,20 @@ struct HotkeyCombination: Codable, Equatable {
     keyEquivalent: HotkeyCombination.arrowKeyEquivalent(.rightArrow)
   )
 
+  static let defaultMoveLeft = HotkeyCombination(
+    keyCode: UInt32(kVK_LeftArrow),
+    modifiers: UInt32(controlKey) | UInt32(optionKey),
+    displayKey: "←",
+    keyEquivalent: HotkeyCombination.arrowKeyEquivalent(.leftArrow)
+  )
+
+  static let defaultMoveRight = HotkeyCombination(
+    keyCode: UInt32(kVK_RightArrow),
+    modifiers: UInt32(controlKey) | UInt32(optionKey),
+    displayKey: "→",
+    keyEquivalent: HotkeyCombination.arrowKeyEquivalent(.rightArrow)
+  )
+
   static let defaultLastSpace = HotkeyCombination(
     keyCode: UInt32(kVK_ANSI_KeypadPlus),
     modifiers: HotkeyCombination.defaultModifierMask,
@@ -195,6 +209,22 @@ struct HotkeyCombination: Codable, Equatable {
       return ("F11", String(Character(UnicodeScalar(NSF11FunctionKey)!)))
     case kVK_F12:
       return ("F12", String(Character(UnicodeScalar(NSF12FunctionKey)!)))
+    case kVK_F13:
+      return ("F13", String(Character(UnicodeScalar(NSF13FunctionKey)!)))
+    case kVK_F14:
+      return ("F14", String(Character(UnicodeScalar(NSF14FunctionKey)!)))
+    case kVK_F15:
+      return ("F15", String(Character(UnicodeScalar(NSF15FunctionKey)!)))
+    case kVK_F16:
+      return ("F16", String(Character(UnicodeScalar(NSF16FunctionKey)!)))
+    case kVK_F17:
+      return ("F17", String(Character(UnicodeScalar(NSF17FunctionKey)!)))
+    case kVK_F18:
+      return ("F18", String(Character(UnicodeScalar(NSF18FunctionKey)!)))
+    case kVK_F19:
+      return ("F19", String(Character(UnicodeScalar(NSF19FunctionKey)!)))
+    case kVK_F20:
+      return ("F20", String(Character(UnicodeScalar(NSF20FunctionKey)!)))
     // Home/End/Page
     case kVK_Home:
       return ("↖", String(Character(UnicodeScalar(NSHomeFunctionKey)!)))
@@ -241,14 +271,18 @@ struct HotkeyCombination: Codable, Equatable {
 enum HotkeyIdentifier: String, CaseIterable {
   case left
   case right
+  case moveLeft
+  case moveRight
   case space1, space2, space3, space4, space5
   case space6, space7, space8, space9, space10
   case lastSpace
-  
+
   var displayName: String {
     switch self {
     case .left: return "Switch to space on the left"
     case .right: return "Switch to space on the right"
+    case .moveLeft: return "Move window to space on the left"
+    case .moveRight: return "Move window to space on the right"
     case .space1: return "Switch to space 1"
     case .space2: return "Switch to space 2"
     case .space3: return "Switch to space 3"
@@ -269,6 +303,8 @@ final class HotkeyStore: ObservableObject {
 
   @Published private(set) var leftHotkey: HotkeyCombination
   @Published private(set) var rightHotkey: HotkeyCombination
+  @Published private(set) var moveLeftHotkey: HotkeyCombination
+  @Published private(set) var moveRightHotkey: HotkeyCombination
   @Published private(set) var space1Hotkey: HotkeyCombination
   @Published private(set) var space2Hotkey: HotkeyCombination
   @Published private(set) var space3Hotkey: HotkeyCombination
@@ -288,6 +324,8 @@ final class HotkeyStore: ObservableObject {
     self.defaults = defaults
     leftHotkey = defaults.hotkey(forKey: DefaultsKey.left.rawValue) ?? .defaultLeft
     rightHotkey = defaults.hotkey(forKey: DefaultsKey.right.rawValue) ?? .defaultRight
+    moveLeftHotkey = defaults.hotkey(forKey: DefaultsKey.moveLeft.rawValue) ?? .defaultMoveLeft
+    moveRightHotkey = defaults.hotkey(forKey: DefaultsKey.moveRight.rawValue) ?? .defaultMoveRight
     space1Hotkey = defaults.hotkey(forKey: DefaultsKey.space1.rawValue) ?? .defaultForSpace(1)
     space2Hotkey = defaults.hotkey(forKey: DefaultsKey.space2.rawValue) ?? .defaultForSpace(2)
     space3Hotkey = defaults.hotkey(forKey: DefaultsKey.space3.rawValue) ?? .defaultForSpace(3)
@@ -316,6 +354,14 @@ final class HotkeyStore: ObservableObject {
       guard combination != rightHotkey else { return }
       rightHotkey = combination
       defaults.setHotkey(combination, forKey: DefaultsKey.right.rawValue)
+    case .moveLeft:
+      guard combination != moveLeftHotkey else { return }
+      moveLeftHotkey = combination
+      defaults.setHotkey(combination, forKey: DefaultsKey.moveLeft.rawValue)
+    case .moveRight:
+      guard combination != moveRightHotkey else { return }
+      moveRightHotkey = combination
+      defaults.setHotkey(combination, forKey: DefaultsKey.moveRight.rawValue)
     case .space1:
       guard combination != space1Hotkey else { return }
       space1Hotkey = combination
@@ -366,6 +412,8 @@ final class HotkeyStore: ObservableObject {
   func resetToDefaults() {
     leftHotkey = .defaultLeft
     rightHotkey = .defaultRight
+    moveLeftHotkey = .defaultMoveLeft
+    moveRightHotkey = .defaultMoveRight
     space1Hotkey = .defaultForSpace(1)
     space2Hotkey = .defaultForSpace(2)
     space3Hotkey = .defaultForSpace(3)
@@ -380,6 +428,8 @@ final class HotkeyStore: ObservableObject {
 
     defaults.setHotkey(leftHotkey, forKey: DefaultsKey.left.rawValue)
     defaults.setHotkey(rightHotkey, forKey: DefaultsKey.right.rawValue)
+    defaults.setHotkey(moveLeftHotkey, forKey: DefaultsKey.moveLeft.rawValue)
+    defaults.setHotkey(moveRightHotkey, forKey: DefaultsKey.moveRight.rawValue)
     defaults.setHotkey(space1Hotkey, forKey: DefaultsKey.space1.rawValue)
     defaults.setHotkey(space2Hotkey, forKey: DefaultsKey.space2.rawValue)
     defaults.setHotkey(space3Hotkey, forKey: DefaultsKey.space3.rawValue)
@@ -397,6 +447,8 @@ final class HotkeyStore: ObservableObject {
     switch identifier {
     case .left: return leftHotkey
     case .right: return rightHotkey
+    case .moveLeft: return moveLeftHotkey
+    case .moveRight: return moveRightHotkey
     case .space1: return space1Hotkey
     case .space2: return space2Hotkey
     case .space3: return space3Hotkey
@@ -424,6 +476,8 @@ final class HotkeyStore: ObservableObject {
   private enum DefaultsKey: String {
     case left = "hotkey.left"
     case right = "hotkey.right"
+    case moveLeft = "hotkey.moveLeft"
+    case moveRight = "hotkey.moveRight"
     case space1 = "hotkey.space1"
     case space2 = "hotkey.space2"
     case space3 = "hotkey.space3"

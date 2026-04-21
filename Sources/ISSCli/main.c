@@ -5,7 +5,7 @@
 #include <string.h>
 
 static void print_usage(const char *progName) {
-    fprintf(stderr, "Usage: %s [left|right|index <n>]\n", progName);
+    fprintf(stderr, "Usage: %s [left|right|mv-left|mv-right|index <n>]\n", progName);
 }
 
 int main(int argc, char **argv) {
@@ -16,6 +16,7 @@ int main(int argc, char **argv) {
 
     ISSDirection direction = ISSDirectionLeft;
     bool useIndex = false;
+    bool moveAndFollow = false;
     unsigned int targetIndex = 0;
 
     if (argc > 1) {
@@ -23,6 +24,12 @@ int main(int argc, char **argv) {
             direction = ISSDirectionRight;
         } else if (!strcmp(argv[1], "left") || !strcmp(argv[1], "l") || !strcmp(argv[1], "0")) {
             direction = ISSDirectionLeft;
+        } else if (!strcmp(argv[1], "mv-right") || !strcmp(argv[1], "mr")) {
+            direction = ISSDirectionRight;
+            moveAndFollow = true;
+        } else if (!strcmp(argv[1], "mv-left") || !strcmp(argv[1], "ml")) {
+            direction = ISSDirectionLeft;
+            moveAndFollow = true;
         } else if (!strcmp(argv[1], "index") || !strcmp(argv[1], "i")) {
             if (argc < 3) {
                 print_usage(argv[0]);
@@ -48,6 +55,8 @@ int main(int argc, char **argv) {
     bool success = false;
     if (useIndex) {
         success = iss_switch_to_index(targetIndex);
+    } else if (moveAndFollow) {
+        success = iss_switch_and_follow(direction);
     } else {
         success = iss_switch(direction);
     }

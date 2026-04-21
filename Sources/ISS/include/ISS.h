@@ -64,6 +64,18 @@ bool iss_can_move(ISSSpaceInfo info, ISSDirection direction);
 bool iss_switch_to_index(unsigned int targetIndex);
 
 /**
+ * @brief Moves the currently focused window to the adjacent Space and switches to it.
+ *
+ * Strict: if the window move cannot be attempted — no focused window, fullscreen
+ * window, AX bridge unavailable, or the private move API is missing — the call
+ * returns false and does NOT switch Spaces.
+ *
+ * @param direction The direction to move the window and switch.
+ * @return true if both the move and switch were posted, false otherwise.
+ */
+bool iss_switch_and_follow(ISSDirection direction);
+
+/**
  * @brief Enables or disables interception of trackpad horizontal swipe gestures.
  *
  * When enabled, native horizontal dock-swipe gestures are suppressed and

@@ -25,7 +25,7 @@ final class KeyboardShortcutsViewController: NSViewController {
   private var shortcuts: [ShortcutRow] = []
 
   override func loadView() {
-    view = RecordingView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+    view = RecordingView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
   }
 
   override func viewDidLoad() {
@@ -44,7 +44,7 @@ final class KeyboardShortcutsViewController: NSViewController {
 
     let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
     nameColumn.title = "Action"
-    nameColumn.width = 210
+    nameColumn.width = 280
     tableView.addTableColumn(nameColumn)
 
     let shortcutColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("shortcut"))
@@ -98,6 +98,10 @@ final class KeyboardShortcutsViewController: NSViewController {
     store.$leftHotkey.receive(on: RunLoop.main).sink { [weak self] _ in self?.loadShortcuts() }
       .store(in: &cancellables)
     store.$rightHotkey.receive(on: RunLoop.main).sink { [weak self] _ in self?.loadShortcuts() }
+      .store(in: &cancellables)
+    store.$moveLeftHotkey.receive(on: RunLoop.main).sink { [weak self] _ in self?.loadShortcuts() }
+      .store(in: &cancellables)
+    store.$moveRightHotkey.receive(on: RunLoop.main).sink { [weak self] _ in self?.loadShortcuts() }
       .store(in: &cancellables)
     store.$space1Hotkey.receive(on: RunLoop.main).sink { [weak self] _ in self?.loadShortcuts() }
       .store(in: &cancellables)
@@ -220,6 +224,8 @@ extension KeyboardShortcutsViewController: NSTableViewDelegate {
     switch identifier {
     case .left: defaultCombination = .defaultLeft
     case .right: defaultCombination = .defaultRight
+    case .moveLeft: defaultCombination = .defaultMoveLeft
+    case .moveRight: defaultCombination = .defaultMoveRight
     case .space1: defaultCombination = .defaultForSpace(1)
     case .space2: defaultCombination = .defaultForSpace(2)
     case .space3: defaultCombination = .defaultForSpace(3)
@@ -253,12 +259,14 @@ extension KeyboardShortcutsViewController: NSTableViewDelegate {
   private func handleRecordingResult(
     _ combination: HotkeyCombination, for identifier: HotkeyIdentifier
   ) {
-    let otherIdentifier: HotkeyIdentifier = identifier == .left ? .right : .left
-    if store.combination(for: otherIdentifier) == combination {
+    let conflict = HotkeyIdentifier.allCases.first { other in
+      other != identifier && store.combination(for: other) == combination
+    }
+    if let conflict {
       NSSound.beep()
       let alert = NSAlert()
       alert.messageText = "Shortcut already in use"
-      alert.informativeText = "This shortcut is already assigned to another action."
+      alert.informativeText = "This shortcut is already assigned to \"\(conflict.displayName)\"."
       alert.alertStyle = .warning
       alert.addButton(withTitle: "OK")
       alert.runModal()

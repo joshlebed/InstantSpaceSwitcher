@@ -185,6 +185,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     hotkeyStore.$rightHotkey.receive(on: RunLoop.main).sink { [weak self] in
       self?.registerHotkey(for: .right, combination: $0)
     }.store(in: &cancellables)
+    hotkeyStore.$moveLeftHotkey.receive(on: RunLoop.main).sink { [weak self] in
+      self?.registerHotkey(for: .moveLeft, combination: $0)
+    }.store(in: &cancellables)
+    hotkeyStore.$moveRightHotkey.receive(on: RunLoop.main).sink { [weak self] in
+      self?.registerHotkey(for: .moveRight, combination: $0)
+    }.store(in: &cancellables)
     hotkeyStore.$space1Hotkey.receive(on: RunLoop.main).sink { [weak self] in
       self?.registerHotkey(for: .space1, combination: $0)
     }.store(in: &cancellables)
@@ -251,6 +257,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.performSpaceSwitch(ISSDirectionLeft)
       case .right:
         self.performSpaceSwitch(ISSDirectionRight)
+      case .moveLeft:
+        self.performMoveWindowAndSwitch(ISSDirectionLeft)
+      case .moveRight:
+        self.performMoveWindowAndSwitch(ISSDirectionRight)
       case .space1:
         self.performSpaceSwitchToIndex(0)
       case .space2:
@@ -279,6 +289,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   private func performSpaceSwitch(_ direction: ISSDirection) {
     if !iss_switch(direction) {
+      NSSound.beep()
+      return
+    }
+    refreshSpaceInfo()
+  }
+
+  private func performMoveWindowAndSwitch(_ direction: ISSDirection) {
+    if !iss_switch_and_follow(direction) {
       NSSound.beep()
       return
     }

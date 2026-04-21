@@ -261,6 +261,10 @@ final class HotkeyPreferencesView: NSView {
       store.update(.defaultLeft, for: .left)
     case .right:
       store.update(.defaultRight, for: .right)
+    case .moveLeft:
+      store.update(.defaultMoveLeft, for: .moveLeft)
+    case .moveRight:
+      store.update(.defaultMoveRight, for: .moveRight)
     case .space1:
       store.update(.defaultForSpace(1), for: .space1)
     case .space2:

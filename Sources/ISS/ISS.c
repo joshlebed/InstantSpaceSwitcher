@@ -53,6 +53,25 @@ extern CFStringRef CGSCopyActiveMenuBarDisplayIdentifier(CGSConnectionID connect
 extern CGSConnectionID CGSMainConnectionID(void) __attribute__((weak_import));
 extern CGSSpaceID CGSGetActiveSpace(CGSConnectionID connection) __attribute__((weak_import));
 
+extern void CGSMoveWindowsToManagedSpace(CGSConnectionID connection,
+                                         CFArrayRef windowIDs,
+                                         CGSSpaceID spaceID) __attribute__((weak_import));
+
+// SLS* lives in SkyLight.framework which isn't explicitly linked; resolve at runtime.
+typedef void (*SLSMoveWindowsFn)(CGSConnectionID, CFArrayRef, CGSSpaceID);
+static SLSMoveWindowsFn resolve_sls_move_windows(void) {
+    static SLSMoveWindowsFn cached = NULL;
+    static bool resolved = false;
+    if (!resolved) {
+        cached = (SLSMoveWindowsFn)dlsym(RTLD_DEFAULT, "SLSMoveWindowsToManagedSpace");
+        resolved = true;
+    }
+    return cached;
+}
+
+extern AXError _AXUIElementGetWindow(AXUIElementRef element,
+                                     CGWindowID *outID) __attribute__((weak_import));
+
 static CFMachPortRef globalTap = NULL;
 static CFRunLoopSourceRef globalSource = NULL;
 
@@ -99,8 +118,11 @@ static void set_prediction(const char *displayID, unsigned int index) {
 static bool extract_space_info_from_display(CFDictionaryRef displayDict,
                                             CGSSpaceID activeSpace,
                                             bool hasActiveSpace,
-                                            ISSSpaceInfo *outInfo);
-static bool load_space_info_for_display(ISSSpaceInfo *info, bool useCursorDisplay);
+                                            ISSSpaceInfo *outInfo,
+                                            CFMutableArrayRef outSpaceIDs);
+static bool load_space_info_for_display(ISSSpaceInfo *info,
+                                        bool useCursorDisplay,
+                                        CFMutableArrayRef outSpaceIDs);
 static bool iss_perform_switch_gesture(ISSDirection direction, double velocity);
 static bool iss_switch_with_info(const ISSSpaceInfo *info, ISSDirection direction);
 static bool iss_should_block_switch(const ISSSpaceInfo *info, ISSDirection direction);
@@ -225,7 +247,8 @@ static bool cgs_symbols_available(void) {
 static bool extract_space_info_from_display(CFDictionaryRef displayDict,
                                             CGSSpaceID activeSpace,
                                             bool hasActiveSpace,
-                                            ISSSpaceInfo *outInfo) {
+                                            ISSSpaceInfo *outInfo,
+                                            CFMutableArrayRef outSpaceIDs) {
     if (!displayDict || !outInfo) {
         return false;
     }
@@ -281,6 +304,13 @@ static bool extract_space_info_from_display(CFDictionaryRef displayDict,
                 activeIndex = totalSpaces;
                 foundActive = true;
             }
+            if (outSpaceIDs) {
+                CFNumberRef boxed = CFNumberCreate(NULL, kCFNumberSInt64Type, &candidate);
+                if (boxed) {
+                    CFArrayAppendValue(outSpaceIDs, boxed);
+                    CFRelease(boxed);
+                }
+            }
             totalSpaces++;
         }
     }
@@ -294,7 +324,9 @@ static bool extract_space_info_from_display(CFDictionaryRef displayDict,
     return true;
 }
 
-static bool load_space_info_for_display(ISSSpaceInfo *info, bool useCursorDisplay) {
+static bool load_space_info_for_display(ISSSpaceInfo *info,
+                                        bool useCursorDisplay,
+                                        CFMutableArrayRef outSpaceIDs) {
     if (!cgs_symbols_available()) {
         fprintf(stderr, "ISS: required CGS symbols missing\n");
         return false;
@@ -387,7 +419,7 @@ static bool load_space_info_for_display(ISSSpaceInfo *info, bool useCursorDispla
 
     bool success = false;
     if (targetDisplay) {
-        success = extract_space_info_from_display(targetDisplay, activeSpace, hasActiveSpace, info);
+        success = extract_space_info_from_display(targetDisplay, activeSpace, hasActiveSpace, info, outSpaceIDs);
     }
 
     if (activeDisplayIdentifier) {
@@ -531,6 +563,12 @@ void iss_set_overlay_detection_enabled(bool enabled) {
 }
 
 bool iss_init(void) {
+    // Ensure diagnostic fprintf(stderr, ...) flushes immediately in release builds.
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    fprintf(stderr, "ISS: iss_init entered (pid=%d)\n", getpid());
+    fflush(stderr);
+
     if (globalTap) {
         return true;
     }
@@ -584,7 +622,7 @@ bool iss_get_space_info(ISSSpaceInfo *info) {
     }
 
     memset(info, 0, sizeof(*info));
-    return load_space_info_for_display(info, true);
+    return load_space_info_for_display(info, true, NULL);
 }
 
 bool iss_get_menubar_space_info(ISSSpaceInfo *info) {
@@ -593,7 +631,7 @@ bool iss_get_menubar_space_info(ISSSpaceInfo *info) {
     }
 
     memset(info, 0, sizeof(*info));
-    return load_space_info_for_display(info, false);
+    return load_space_info_for_display(info, false, NULL);
 }
 
 static bool iss_switch_with_info(const ISSSpaceInfo *info, ISSDirection direction) {
@@ -623,6 +661,146 @@ bool iss_switch(ISSDirection direction) {
     }
 
     return iss_perform_switch_gesture(direction, gestureSpeed);
+}
+
+static bool iss_get_focused_window_id(CGWindowID *outID) {
+    if (!outID) return false;
+    if (&_AXUIElementGetWindow == NULL) return false;
+
+    AXUIElementRef sys = AXUIElementCreateSystemWide();
+    if (!sys) return false;
+
+    AXUIElementRef focusedApp = NULL;
+    AXError err = AXUIElementCopyAttributeValue(
+        sys, kAXFocusedApplicationAttribute, (CFTypeRef *)&focusedApp);
+    CFRelease(sys);
+    if (err != kAXErrorSuccess || !focusedApp) return false;
+
+    AXUIElementRef focusedWin = NULL;
+    err = AXUIElementCopyAttributeValue(
+        focusedApp, kAXFocusedWindowAttribute, (CFTypeRef *)&focusedWin);
+    CFRelease(focusedApp);
+    if (err != kAXErrorSuccess || !focusedWin) return false;
+
+    // Fullscreen windows live on their own Space and cannot be moved.
+    CFTypeRef isFullscreen = NULL;
+    if (AXUIElementCopyAttributeValue(focusedWin,
+            CFSTR("AXFullScreen"), &isFullscreen) == kAXErrorSuccess && isFullscreen) {
+        bool fs = CFGetTypeID(isFullscreen) == CFBooleanGetTypeID() &&
+                  CFBooleanGetValue((CFBooleanRef)isFullscreen);
+        CFRelease(isFullscreen);
+        if (fs) { CFRelease(focusedWin); return false; }
+    }
+
+    CGWindowID wid = 0;
+    err = _AXUIElementGetWindow(focusedWin, &wid);
+    CFRelease(focusedWin);
+    if (err != kAXErrorSuccess || wid == 0) return false;
+
+    *outID = wid;
+    return true;
+}
+
+bool iss_switch_and_follow(ISSDirection direction) {
+    fprintf(stderr, "ISS: iss_switch_and_follow(direction=%s)\n",
+            direction == ISSDirectionLeft ? "left" : "right");
+    fprintf(stderr, "ISS:   CGSMoveWindowsToManagedSpace available: %s\n",
+            &CGSMoveWindowsToManagedSpace != NULL ? "yes" : "no");
+    fprintf(stderr, "ISS:   SLSMoveWindowsToManagedSpace available: %s\n",
+            resolve_sls_move_windows() != NULL ? "yes" : "no");
+    fprintf(stderr, "ISS:   _AXUIElementGetWindow available: %s\n",
+            &_AXUIElementGetWindow != NULL ? "yes" : "no");
+
+    ISSSpaceInfo info;
+    memset(&info, 0, sizeof(info));
+
+    CFMutableArrayRef spaceIDs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    if (!spaceIDs) {
+        return false;
+    }
+
+    if (!load_space_info_for_display(&info, true, spaceIDs)) {
+        CFRelease(spaceIDs);
+        return false;
+    }
+
+    if (iss_should_block_switch(&info, direction)) {
+        CFRelease(spaceIDs);
+        return false;
+    }
+
+    unsigned int predicted;
+    unsigned int current = get_prediction(info.displayID, &predicted) ? predicted : info.currentIndex;
+    unsigned int target = (direction == ISSDirectionLeft) ? current - 1 : current + 1;
+
+    CGSSpaceID targetSpaceID = 0;
+    if ((CFIndex)target < CFArrayGetCount(spaceIDs)) {
+        CFNumberRef boxed = (CFNumberRef)CFArrayGetValueAtIndex(spaceIDs, (CFIndex)target);
+        if (boxed) {
+            CFNumberGetValue(boxed, kCFNumberSInt64Type, &targetSpaceID);
+        }
+    }
+    CFRelease(spaceIDs);
+
+    if (targetSpaceID == 0) {
+        fprintf(stderr, "ISS: iss_switch_and_follow: no target space id for index %u\n", target);
+        return false;
+    }
+    SLSMoveWindowsFn slsMove = resolve_sls_move_windows();
+    if ((slsMove == NULL && &CGSMoveWindowsToManagedSpace == NULL) ||
+        &CGSMainConnectionID == NULL) {
+        fprintf(stderr, "ISS: iss_switch_and_follow: move-window symbol unavailable\n");
+        return false;
+    }
+
+    CGWindowID wid = 0;
+    if (!iss_get_focused_window_id(&wid)) {
+        fprintf(stderr, "ISS: iss_switch_and_follow: no movable focused window\n");
+        return false;
+    }
+
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionIncludingWindow, wid);
+    const char *ownerDesc = "?";
+    char ownerBuf[256];
+    if (windowList && CFArrayGetCount(windowList) > 0) {
+        CFDictionaryRef wi = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, 0);
+        CFStringRef owner = (CFStringRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowOwnerName"));
+        if (owner && CFGetTypeID(owner) == CFStringGetTypeID() &&
+            CFStringGetCString(owner, ownerBuf, sizeof(ownerBuf), kCFStringEncodingUTF8)) {
+            ownerDesc = ownerBuf;
+        }
+    }
+    CGSConnectionID cid = CGSMainConnectionID();
+    fprintf(stderr, "ISS:   cid=%d window id=%u owner=%s target space id=%llu\n",
+            (int)cid, wid, ownerDesc, (unsigned long long)targetSpaceID);
+    if (windowList) CFRelease(windowList);
+
+    CFNumberRef widNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &wid);
+    if (!widNum) {
+        return false;
+    }
+    const void *values[1] = { widNum };
+    CFArrayRef wids = CFArrayCreate(NULL, values, 1, &kCFTypeArrayCallBacks);
+    CFRelease(widNum);
+    if (!wids) {
+        return false;
+    }
+    if (slsMove != NULL) {
+        fprintf(stderr, "ISS:   calling SLSMoveWindowsToManagedSpace\n");
+        slsMove(cid, wids, targetSpaceID);
+    } else {
+        fprintf(stderr, "ISS:   calling CGSMoveWindowsToManagedSpace\n");
+        CGSMoveWindowsToManagedSpace(cid, wids, targetSpaceID);
+    }
+    CFRelease(wids);
+
+    if (!iss_switch_with_info(&info, direction)) {
+        return false;
+    }
+    set_prediction(info.displayID, target);
+    if (switchCallback) { switchCallback(target); }
+    return true;
 }
 
 bool iss_switch_to_index(unsigned int targetIndex) {
