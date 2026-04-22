@@ -691,26 +691,128 @@ bool iss_switch(ISSDirection direction) {
 //   - axWindow (optional, owned by caller; released with CFRelease): the
 //     AXUIElement reference so the caller can perform a re-raise after the
 //     move. Pass NULL if you don't need it.
+// CGWindowList-based fallback for AX-hostile apps (Spotify, some Electron apps,
+// etc). Finds the frontmost on-screen non-ISS window on layer 0 and computes
+// the grab point from its CGWindow bounds. Returns false if no candidate.
+static bool iss_find_frontmost_foreign_window_via_cg(CGWindowID *outID,
+                                                     CGPoint *outGrabPoint) {
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!list) return false;
+    CFIndex n = CFArrayGetCount(list);
+    for (CFIndex i = 0; i < n; i++) {
+        CFDictionaryRef wi = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+        CFNumberRef layerNum = (CFNumberRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowLayer"));
+        int layer = 0;
+        if (layerNum) CFNumberGetValue(layerNum, kCFNumberIntType, &layer);
+        if (layer != 0) continue;
+
+        CFStringRef owner = (CFStringRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowOwnerName"));
+        char ownerBuf[256] = {0};
+        if (owner) CFStringGetCString(owner, ownerBuf, sizeof(ownerBuf), kCFStringEncodingUTF8);
+        if (strstr(ownerBuf, "InstantSpaceSwitcher") || strstr(ownerBuf, "ISSCli")) continue;
+
+        CFDictionaryRef bounds = (CFDictionaryRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowBounds"));
+        CGRect rect = {{0,0},{0,0}};
+        if (!bounds || !CGRectMakeWithDictionaryRepresentation(bounds, &rect)) continue;
+        if (rect.size.width < 10 || rect.size.height < 10) continue;
+
+        CFNumberRef widNum = (CFNumberRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowNumber"));
+        if (!widNum) continue;
+        unsigned int foundWid = 0;
+        CFNumberGetValue(widNum, kCFNumberIntType, &foundWid);
+
+        *outID = (CGWindowID)foundWid;
+        // Left-biased grab: past traffic lights (~70 px) into empty title bar
+        // space, before most apps' custom controls (search bars, nav, etc.).
+        outGrabPoint->x = rect.origin.x + 100.0;
+        outGrabPoint->y = rect.origin.y + 3.0;
+
+        // When system-wide AX failed (how we got here), the app may not be
+        // truly frontmost from WindowServer's perspective. Pre-activate it
+        // via its pid — AXUIElementCreateApplication works even when the
+        // system-wide focused-app query fails, since it targets a specific
+        // process.
+        CFNumberRef pidNum = (CFNumberRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowOwnerPID"));
+        pid_t ownerPid = 0;
+        if (pidNum) {
+            int pidVal = 0;
+            CFNumberGetValue(pidNum, kCFNumberIntType, &pidVal);
+            ownerPid = (pid_t)pidVal;
+            AXUIElementRef appEl = AXUIElementCreateApplication(ownerPid);
+            if (appEl) {
+                AXUIElementSetMessagingTimeout(appEl, 0.05);
+                (void)AXUIElementSetAttributeValue(appEl,
+                    kAXFrontmostAttribute, kCFBooleanTrue);
+                CFRelease(appEl);
+            }
+        }
+        fprintf(stderr, "ISS:   AX fallback (CGWindowList): owner=%s pid=%d wid=%u bounds=(%.0f,%.0f %.0fx%.0f) grab=(%.1f, %.1f)\n",
+                ownerBuf, (int)ownerPid, foundWid, rect.origin.x, rect.origin.y,
+                rect.size.width, rect.size.height,
+                outGrabPoint->x, outGrabPoint->y);
+        CFRelease(list);
+        return true;
+    }
+    CFRelease(list);
+    return false;
+}
+
 static bool iss_get_focused_window_and_grab_point(CGWindowID *outID,
                                                    CGPoint *outGrabPoint,
                                                    AXUIElementRef *outAxWindow) {
     if (!outID || !outGrabPoint) return false;
-    if (&_AXUIElementGetWindow == NULL) return false;
+    if (&_AXUIElementGetWindow == NULL) {
+        fprintf(stderr, "ISS:   AX helper: _AXUIElementGetWindow unavailable\n");
+        return false;
+    }
 
     AXUIElementRef sys = AXUIElementCreateSystemWide();
     if (!sys) return false;
+    // Short AX messaging timeout so quirky apps (Spotify/Electron) fail fast
+    // and we can fall back. Default is 6 seconds, way too long for our hotkey.
+    AXUIElementSetMessagingTimeout(sys, 0.05);
 
+    // Retry 3x with backoff — AX is sometimes transiently slow even for
+    // well-behaved apps immediately after focus change.
     AXUIElementRef focusedApp = NULL;
-    AXError err = AXUIElementCopyAttributeValue(
-        sys, kAXFocusedApplicationAttribute, (CFTypeRef *)&focusedApp);
+    AXError err = kAXErrorCannotComplete;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = AXUIElementCopyAttributeValue(
+            sys, kAXFocusedApplicationAttribute, (CFTypeRef *)&focusedApp);
+        if (err == kAXErrorSuccess && focusedApp) break;
+        if (focusedApp) { CFRelease(focusedApp); focusedApp = NULL; }
+        usleep(15 * 1000);
+    }
     CFRelease(sys);
-    if (err != kAXErrorSuccess || !focusedApp) return false;
+
+    if (err != kAXErrorSuccess || !focusedApp) {
+        fprintf(stderr, "ISS:   AX helper: focusedApp err=%d after retries; falling back to CGWindowList\n",
+                (int)err);
+        if (outAxWindow) *outAxWindow = NULL;
+        return iss_find_frontmost_foreign_window_via_cg(outID, outGrabPoint);
+    }
+
+    pid_t appPid = 0;
+    AXUIElementGetPid(focusedApp, &appPid);
+    AXUIElementSetMessagingTimeout(focusedApp, 0.05);
 
     AXUIElementRef focusedWin = NULL;
-    err = AXUIElementCopyAttributeValue(
-        focusedApp, kAXFocusedWindowAttribute, (CFTypeRef *)&focusedWin);
+    for (int attempt = 0; attempt < 3; attempt++) {
+        err = AXUIElementCopyAttributeValue(
+            focusedApp, kAXFocusedWindowAttribute, (CFTypeRef *)&focusedWin);
+        if (err == kAXErrorSuccess && focusedWin) break;
+        if (focusedWin) { CFRelease(focusedWin); focusedWin = NULL; }
+        usleep(15 * 1000);
+    }
     CFRelease(focusedApp);
-    if (err != kAXErrorSuccess || !focusedWin) return false;
+    if (err != kAXErrorSuccess || !focusedWin) {
+        fprintf(stderr, "ISS:   AX helper: focusedWindow err=%d (pid=%d); falling back to CGWindowList\n",
+                (int)err, (int)appPid);
+        if (outAxWindow) *outAxWindow = NULL;
+        return iss_find_frontmost_foreign_window_via_cg(outID, outGrabPoint);
+    }
 
     // Fullscreen windows live on their own Space and cannot be moved.
     CFTypeRef isFullscreen = NULL;
@@ -719,12 +821,21 @@ static bool iss_get_focused_window_and_grab_point(CGWindowID *outID,
         bool fs = CFGetTypeID(isFullscreen) == CFBooleanGetTypeID() &&
                   CFBooleanGetValue((CFBooleanRef)isFullscreen);
         CFRelease(isFullscreen);
-        if (fs) { CFRelease(focusedWin); return false; }
+        if (fs) {
+            fprintf(stderr, "ISS:   AX helper: window is fullscreen (pid=%d)\n", (int)appPid);
+            CFRelease(focusedWin);
+            return false;
+        }
     }
 
     CGWindowID wid = 0;
     err = _AXUIElementGetWindow(focusedWin, &wid);
-    if (err != kAXErrorSuccess || wid == 0) { CFRelease(focusedWin); return false; }
+    if (err != kAXErrorSuccess || wid == 0) {
+        fprintf(stderr, "ISS:   AX helper: _AXUIElementGetWindow err=%d wid=%u (pid=%d)\n",
+                (int)err, wid, (int)appPid);
+        CFRelease(focusedWin);
+        return false;
+    }
 
     // Window frame from AX (global screen coords, y grows down).
     CGPoint winPos = {0, 0};
@@ -1009,17 +1120,24 @@ bool iss_switch_and_follow(ISSDirection direction) {
             wid, ownerDesc, grab.x, grab.y);
     if (windowList) CFRelease(windowList);
 
-    // Build the four drag-sequence events.
-    CGEventRef mv   = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,       grab, kCGMouseButtonLeft);
-    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,    grab, kCGMouseButtonLeft);
-    CGEventRef drag = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDragged, grab, kCGMouseButtonLeft);
-    CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,      grab, kCGMouseButtonLeft);
+    // Build the drag-sequence events with a real HID-backed event source.
+    // Source-less events (NULL source) are rejected by some apps (sandboxed
+    // Chromium); a HIDSystemState-backed source makes our events look like
+    // genuine HID input. All events share the grab point — zero motion keeps
+    // the window visually stationary while WindowServer's drag-across-Spaces
+    // state machine carries it.
+    CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    CGEventRef mv   = CGEventCreateMouseEvent(src, kCGEventMouseMoved,       grab, kCGMouseButtonLeft);
+    CGEventRef down = CGEventCreateMouseEvent(src, kCGEventLeftMouseDown,    grab, kCGMouseButtonLeft);
+    CGEventRef drag = CGEventCreateMouseEvent(src, kCGEventLeftMouseDragged, grab, kCGMouseButtonLeft);
+    CGEventRef up   = CGEventCreateMouseEvent(src, kCGEventLeftMouseUp,      grab, kCGMouseButtonLeft);
     if (!mv || !down || !drag || !up) {
         fprintf(stderr, "ISS:   CGEventCreate failed\n");
         if (mv) CFRelease(mv);
         if (down) CFRelease(down);
         if (drag) CFRelease(drag);
         if (up) CFRelease(up);
+        if (src) CFRelease(src);
         if (axWin) CFRelease(axWin);
         return false;
     }
@@ -1100,6 +1218,7 @@ bool iss_switch_and_follow(ISSDirection direction) {
     CFRelease(down);
     CFRelease(drag);
     CFRelease(up);
+    if (src) CFRelease(src);
 
     if (switched) {
         set_prediction(info.displayID, targetZeroBased);
