@@ -64,6 +64,29 @@ bool iss_can_move(ISSSpaceInfo info, ISSDirection direction);
 bool iss_switch_to_index(unsigned int targetIndex);
 
 /**
+ * @brief Debug hook: move a specific window id to a specific managed-space id.
+ *
+ * Performs the compatID/workspace dance without touching AX, predictions, or
+ * the Space switch. Exposed so ISSCli can exercise the move path directly
+ * with known arguments, shortening the diagnostic feedback loop.
+ *
+ * @param windowID     Zero-based CGWindowID of the window to move.
+ * @param targetSpaceID id64 of the destination managed space.
+ * @return true if the dance ran (does not guarantee WindowServer accepted it).
+ */
+bool iss_move_window_raw(unsigned int windowID, unsigned long long targetSpaceID);
+
+/**
+ * @brief Debug hook: alternative move via CGSAddWindowsToSpaces + CGSRemoveWindowsFromSpaces.
+ */
+bool iss_move_window_add_remove(unsigned int windowID, unsigned long long targetSpaceID);
+
+/**
+ * @brief Debug: mark a window as preferring the current space (sticky during transitions).
+ */
+bool iss_set_window_prefers_current(unsigned int windowID, bool prefer);
+
+/**
  * @brief Moves the currently focused window to the adjacent Space and switches to it.
  *
  * Strict: if the window move cannot be attempted — no focused window, fullscreen

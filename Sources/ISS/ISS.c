@@ -4,6 +4,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CGEventTypes.h>
 #include <assert.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <float.h>
 #include <stdbool.h>
@@ -57,20 +58,41 @@ extern void CGSMoveWindowsToManagedSpace(CGSConnectionID connection,
                                          CFArrayRef windowIDs,
                                          CGSSpaceID spaceID) __attribute__((weak_import));
 
-// SLS* lives in SkyLight.framework which isn't explicitly linked; resolve at runtime.
-typedef void (*SLSMoveWindowsFn)(CGSConnectionID, CFArrayRef, CGSSpaceID);
-static SLSMoveWindowsFn resolve_sls_move_windows(void) {
-    static SLSMoveWindowsFn cached = NULL;
-    static bool resolved = false;
-    if (!resolved) {
-        cached = (SLSMoveWindowsFn)dlsym(RTLD_DEFAULT, "SLSMoveWindowsToManagedSpace");
-        resolved = true;
-    }
-    return cached;
-}
+// macOS Sonoma+ restricts CGSMoveWindowsToManagedSpace to same-connection
+// windows. Raycast's binary (nm + otool) shows they use the legacy compatID/
+// workspace path instead. We match their sequence.
+extern CGError CGSSpaceSetCompatID(CGSConnectionID cid,
+                                   CGSSpaceID sid,
+                                   int compatID) __attribute__((weak_import));
+extern CGError CGSSetWindowListWorkspace(CGSConnectionID cid,
+                                         CGWindowID *wids,
+                                         int count,
+                                         int workspace) __attribute__((weak_import));
+
+extern void CGSAddWindowsToSpaces(CGSConnectionID cid,
+                                  CFArrayRef windows,
+                                  CFArrayRef spaces) __attribute__((weak_import));
+extern void CGSRemoveWindowsFromSpaces(CGSConnectionID cid,
+                                       CFArrayRef windows,
+                                       CFArrayRef spaces) __attribute__((weak_import));
+extern CFArrayRef CGSCopySpacesForWindows(CGSConnectionID cid,
+                                          int mask,
+                                          CFArrayRef windows) __attribute__((weak_import));
+
+typedef CGError (*SLSSetWindowPrefersCurrentSpaceFn)(CGSConnectionID, CGWindowID, bool);
 
 extern AXError _AXUIElementGetWindow(AXUIElementRef element,
                                      CGWindowID *outID) __attribute__((weak_import));
+
+// Symbolic hotkey support — lets us fetch the user-configured keyboard
+// shortcut for "Switch to Desktop N" (IDs 118..133) and post it.
+typedef int CGSSymbolicHotKey;
+extern CGError CGSGetSymbolicHotKeyValue(CGSSymbolicHotKey hotKey,
+                                          unsigned short *outChar,
+                                          CGKeyCode *outKeyCode,
+                                          CGEventFlags *outFlags) __attribute__((weak_import));
+extern bool CGSIsSymbolicHotKeyEnabled(CGSSymbolicHotKey hotKey) __attribute__((weak_import));
+extern CGError CGSSetSymbolicHotKeyEnabled(CGSSymbolicHotKey hotKey, bool enabled) __attribute__((weak_import));
 
 static CFMachPortRef globalTap = NULL;
 static CFRunLoopSourceRef globalSource = NULL;
@@ -663,8 +685,16 @@ bool iss_switch(ISSDirection direction) {
     return iss_perform_switch_gesture(direction, gestureSpeed);
 }
 
-static bool iss_get_focused_window_id(CGWindowID *outID) {
-    if (!outID) return false;
+// Populates outputs with:
+//   - wid: the focused window's CGWindowID
+//   - grab: a point on its title bar for the synthetic drag
+//   - axWindow (optional, owned by caller; released with CFRelease): the
+//     AXUIElement reference so the caller can perform a re-raise after the
+//     move. Pass NULL if you don't need it.
+static bool iss_get_focused_window_and_grab_point(CGWindowID *outID,
+                                                   CGPoint *outGrabPoint,
+                                                   AXUIElementRef *outAxWindow) {
+    if (!outID || !outGrabPoint) return false;
     if (&_AXUIElementGetWindow == NULL) return false;
 
     AXUIElementRef sys = AXUIElementCreateSystemWide();
@@ -694,73 +724,277 @@ static bool iss_get_focused_window_id(CGWindowID *outID) {
 
     CGWindowID wid = 0;
     err = _AXUIElementGetWindow(focusedWin, &wid);
-    CFRelease(focusedWin);
-    if (err != kAXErrorSuccess || wid == 0) return false;
+    if (err != kAXErrorSuccess || wid == 0) { CFRelease(focusedWin); return false; }
+
+    // Window frame from AX (global screen coords, y grows down).
+    CGPoint winPos = {0, 0};
+    CGSize  winSize = {0, 0};
+    AXValueRef posVal = NULL, sizeVal = NULL;
+    if (AXUIElementCopyAttributeValue(focusedWin,
+            kAXPositionAttribute, (CFTypeRef *)&posVal) == kAXErrorSuccess && posVal) {
+        AXValueGetValue(posVal, kAXValueCGPointType, &winPos);
+        CFRelease(posVal);
+    }
+    if (AXUIElementCopyAttributeValue(focusedWin,
+            kAXSizeAttribute, (CFTypeRef *)&sizeVal) == kAXErrorSuccess && sizeVal) {
+        AXValueGetValue(sizeVal, kAXValueCGSizeType, &winSize);
+        CFRelease(sizeVal);
+    }
+
+    // Grab point: horizontal midpoint, 3px below the top edge. Matches
+    // Hammerspoon's 2026 drag-and-switch technique; avoids the traffic-light
+    // buttons on the left and works reliably across apps with unusual
+    // title-bar layouts.
+    CGPoint grab = {
+        winPos.x + winSize.width / 2.0,
+        winPos.y + 3.0
+    };
 
     *outID = wid;
+    *outGrabPoint = grab;
+    if (outAxWindow) {
+        *outAxWindow = focusedWin;  // transfer ownership to caller
+    } else {
+        CFRelease(focusedWin);
+    }
     return true;
 }
 
+
+// Returns a newly allocated CFArray of CFNumber<CGSSpaceID>, or NULL.
+static CFArrayRef iss_copy_spaces_for_window(CGSConnectionID cid, CGWindowID wid) {
+    if (&CGSCopySpacesForWindows == NULL) return NULL;
+    CFNumberRef widNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &wid);
+    if (!widNum) return NULL;
+    const void *values[1] = { widNum };
+    CFArrayRef wids = CFArrayCreate(NULL, values, 1, &kCFTypeArrayCallBacks);
+    CFRelease(widNum);
+    if (!wids) return NULL;
+    // Mask 7 = user-visible + fullscreen + system (yabai uses 7)
+    CFArrayRef spaces = CGSCopySpacesForWindows(cid, 7, wids);
+    CFRelease(wids);
+    return spaces;
+}
+
+// Add-and-remove alternative: CGSAddWindowsToSpaces then CGSRemoveWindowsFromSpaces.
+// Doesn't use the restricted CGSSetWindowListWorkspace path at all.
+// Mark a window to prefer the current space. If this sticks across a space
+// switch, the window "follows" the viewport (this matches what the user sees
+// with Raycast's "Move Window to Next Desktop").
+bool iss_set_window_prefers_current(unsigned int windowID, bool prefer) {
+    fprintf(stderr, "ISS: iss_set_window_prefers_current(wid=%u, prefer=%d)\n",
+            windowID, prefer ? 1 : 0);
+    if (&CGSMainConnectionID == NULL) return false;
+    CGSConnectionID cid = CGSMainConnectionID();
+
+    SLSSetWindowPrefersCurrentSpaceFn fn = (SLSSetWindowPrefersCurrentSpaceFn)
+        dlsym(RTLD_DEFAULT, "SLSSetWindowPrefersCurrentSpace");
+    if (!fn) {
+        fprintf(stderr, "ISS:   SLSSetWindowPrefersCurrentSpace not found\n");
+        return false;
+    }
+    CGError e = fn(cid, (CGWindowID)windowID, prefer);
+    fprintf(stderr, "ISS:   SLSSetWindowPrefersCurrentSpace returned %d\n", (int)e);
+    return e == kCGErrorSuccess;
+}
+
+bool iss_move_window_add_remove(unsigned int windowID, unsigned long long targetSpaceID) {
+    fprintf(stderr, "ISS: iss_move_window_add_remove(wid=%u, sid=%llu)\n",
+            windowID, targetSpaceID);
+    if (&CGSMainConnectionID == NULL) return false;
+    CGSConnectionID cid = CGSMainConnectionID();
+
+    CGWindowID wid = (CGWindowID)windowID;
+    CFNumberRef widNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &wid);
+    if (!widNum) return false;
+    const void *wvals[1] = { widNum };
+    CFArrayRef windows = CFArrayCreate(NULL, wvals, 1, &kCFTypeArrayCallBacks);
+    CFRelease(widNum);
+    if (!windows) return false;
+
+    // Get current spaces for this window to know what to remove it from.
+    CFArrayRef currentSpaces = iss_copy_spaces_for_window(cid, wid);
+    if (currentSpaces) {
+        CFIndex n = CFArrayGetCount(currentSpaces);
+        fprintf(stderr, "ISS:   window currently on %ld space(s):", (long)n);
+        for (CFIndex i = 0; i < n; i++) {
+            CGSSpaceID s = 0;
+            CFNumberGetValue((CFNumberRef)CFArrayGetValueAtIndex(currentSpaces, i),
+                             kCFNumberSInt64Type, &s);
+            fprintf(stderr, " %llu", (unsigned long long)s);
+        }
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "ISS:   could not enumerate current spaces\n");
+    }
+
+    CGSSpaceID tsid = (CGSSpaceID)targetSpaceID;
+    CFNumberRef tsidNum = CFNumberCreate(NULL, kCFNumberSInt64Type, &tsid);
+    const void *svals[1] = { tsidNum };
+    CFArrayRef targetSpaces = CFArrayCreate(NULL, svals, 1, &kCFTypeArrayCallBacks);
+    CFRelease(tsidNum);
+
+    if (&CGSAddWindowsToSpaces != NULL) {
+        CGSAddWindowsToSpaces(cid, windows, targetSpaces);
+        fprintf(stderr, "ISS:   CGSAddWindowsToSpaces posted\n");
+    } else {
+        fprintf(stderr, "ISS:   CGSAddWindowsToSpaces unavailable\n");
+    }
+
+    if (currentSpaces && &CGSRemoveWindowsFromSpaces != NULL) {
+        CGSRemoveWindowsFromSpaces(cid, windows, currentSpaces);
+        fprintf(stderr, "ISS:   CGSRemoveWindowsFromSpaces posted\n");
+    }
+
+    CFRelease(targetSpaces);
+    if (currentSpaces) CFRelease(currentSpaces);
+    CFRelease(windows);
+    return true;
+}
+
+static void iss_log_spaces_for_window(const char *label, CGSConnectionID cid, CGWindowID wid) {
+    CFArrayRef spaces = iss_copy_spaces_for_window(cid, wid);
+    if (!spaces) {
+        fprintf(stderr, "ISS:   %s wid=%u spaces=<nil>\n", label, wid);
+        return;
+    }
+    CFIndex n = CFArrayGetCount(spaces);
+    fprintf(stderr, "ISS:   %s wid=%u spaces=[", label, wid);
+    for (CFIndex i = 0; i < n; i++) {
+        CFNumberRef num = (CFNumberRef)CFArrayGetValueAtIndex(spaces, i);
+        long long sid = 0;
+        CFNumberGetValue(num, kCFNumberSInt64Type, &sid);
+        fprintf(stderr, "%s%lld", i == 0 ? "" : ",", sid);
+    }
+    fprintf(stderr, "]\n");
+    CFRelease(spaces);
+}
+
+bool iss_move_window_raw(unsigned int windowID, unsigned long long targetSpaceID) {
+    fprintf(stderr, "ISS: iss_move_window_raw(wid=%u, sid=%llu)\n",
+            windowID, targetSpaceID);
+    if (&CGSMainConnectionID == NULL) {
+        fprintf(stderr, "ISS:   CGSMainConnectionID unavailable\n");
+        return false;
+    }
+    CGSConnectionID cid = CGSMainConnectionID();
+    fprintf(stderr, "ISS:   cid=%d\n", (int)cid);
+
+    if (&CGSSpaceSetCompatID == NULL || &CGSSetWindowListWorkspace == NULL) {
+        fprintf(stderr, "ISS:   compat-ID symbols unavailable\n");
+        return false;
+    }
+
+    // Matches Raycast's macOS >= 14.5 path exactly:
+    //   CGSSpaceSetCompatID(cid, sid, 0x79616265)
+    //   CGSSetWindowListWorkspace(cid, &wid, 1, 0x79616265)
+    //   CGSSpaceSetCompatID(cid, sid, 0)
+    //   sleep(1)
+    // Return values are intentionally ignored (Raycast does not check them).
+    const int compatID = 0x79616265;
+
+    iss_log_spaces_for_window("BEFORE", cid, (CGWindowID)windowID);
+
+    (void)CGSSpaceSetCompatID(cid, (CGSSpaceID)targetSpaceID, compatID);
+    CGWindowID widArray[1] = { (CGWindowID)windowID };
+    CGError setWorkspaceRet = CGSSetWindowListWorkspace(cid, widArray, 1, compatID);
+    (void)CGSSpaceSetCompatID(cid, (CGSSpaceID)targetSpaceID, 0);
+    fprintf(stderr, "ISS:   compat-ID dance posted; setWorkspaceRet=%d (ignored)\n", (int)setWorkspaceRet);
+
+    iss_log_spaces_for_window("POST-DANCE", cid, (CGWindowID)windowID);
+
+    fprintf(stderr, "ISS:   sleeping 1s (matching Raycast)...\n");
+    sleep(1);
+
+    iss_log_spaces_for_window("POST-SLEEP", cid, (CGWindowID)windowID);
+
+    return true;
+}
+
+// Posts a key-down / key-up pair for the user-configured "Switch to Desktop N"
+// symbolic hotkey (where N is 1-based, 1..16). Enables the hotkey if the user
+// has it disabled in System Settings. Returns false if the symbol lookup fails
+// or the hotkey has no configured keyboard shortcut.
+static bool iss_post_switch_to_desktop_hotkey(unsigned int targetIndexOneBased) {
+    if (targetIndexOneBased < 1 || targetIndexOneBased > 16) return false;
+    if (&CGSGetSymbolicHotKeyValue == NULL) {
+        fprintf(stderr, "ISS:   CGSGetSymbolicHotKeyValue unavailable\n");
+        return false;
+    }
+
+    CGSSymbolicHotKey hotKey = (CGSSymbolicHotKey)(118 + targetIndexOneBased - 1);
+    CGKeyCode keyCode = 0;
+    CGEventFlags flags = 0;
+    CGError err = CGSGetSymbolicHotKeyValue(hotKey, NULL, &keyCode, &flags);
+    if (err != kCGErrorSuccess) {
+        fprintf(stderr, "ISS:   CGSGetSymbolicHotKeyValue(%d) err=%d\n",
+                (int)hotKey, (int)err);
+        return false;
+    }
+    if (&CGSIsSymbolicHotKeyEnabled != NULL &&
+        &CGSSetSymbolicHotKeyEnabled != NULL &&
+        !CGSIsSymbolicHotKeyEnabled(hotKey)) {
+        (void)CGSSetSymbolicHotKeyEnabled(hotKey, true);
+        fprintf(stderr, "ISS:   enabled symbolic hotkey %d\n", (int)hotKey);
+    }
+
+    CGEventRef keyDown = CGEventCreateKeyboardEvent(NULL, keyCode, true);
+    CGEventRef keyUp   = CGEventCreateKeyboardEvent(NULL, keyCode, false);
+    if (!keyDown || !keyUp) {
+        if (keyDown) CFRelease(keyDown);
+        if (keyUp) CFRelease(keyUp);
+        return false;
+    }
+    CGEventSetFlags(keyDown, flags);
+    CGEventSetFlags(keyUp, 0);
+    CGEventPost(kCGHIDEventTap, keyDown);
+    CGEventPost(kCGHIDEventTap, keyUp);
+    CFRelease(keyDown);
+    CFRelease(keyUp);
+    fprintf(stderr, "ISS:   posted symbolic hotkey %d (keycode=%u flags=0x%llx)\n",
+            (int)hotKey, keyCode, (unsigned long long)flags);
+    return true;
+}
+
+// Moves the focused window to the adjacent Space and switches there using
+// Silica/Amethyst's technique: simulate a user-initiated drag on the window's
+// title bar, trigger the built-in "Switch to Desktop N" symbolic hotkey, then
+// release the drag. WindowServer carries the held window along as part of its
+// normal drag-across-Spaces UX — bypassing the macOS 14.5+ window-move
+// authorization gate entirely.
 bool iss_switch_and_follow(ISSDirection direction) {
     fprintf(stderr, "ISS: iss_switch_and_follow(direction=%s)\n",
             direction == ISSDirectionLeft ? "left" : "right");
-    fprintf(stderr, "ISS:   CGSMoveWindowsToManagedSpace available: %s\n",
-            &CGSMoveWindowsToManagedSpace != NULL ? "yes" : "no");
-    fprintf(stderr, "ISS:   SLSMoveWindowsToManagedSpace available: %s\n",
-            resolve_sls_move_windows() != NULL ? "yes" : "no");
-    fprintf(stderr, "ISS:   _AXUIElementGetWindow available: %s\n",
-            &_AXUIElementGetWindow != NULL ? "yes" : "no");
 
     ISSSpaceInfo info;
     memset(&info, 0, sizeof(info));
-
-    CFMutableArrayRef spaceIDs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
-    if (!spaceIDs) {
+    if (!load_space_info_for_display(&info, true, NULL)) {
+        fprintf(stderr, "ISS:   failed to load space info\n");
         return false;
     }
-
-    if (!load_space_info_for_display(&info, true, spaceIDs)) {
-        CFRelease(spaceIDs);
-        return false;
-    }
-
     if (iss_should_block_switch(&info, direction)) {
-        CFRelease(spaceIDs);
+        fprintf(stderr, "ISS:   switch blocked by bounds\n");
         return false;
     }
 
+    // Resolve target space index (1-based for the symbolic hotkey).
     unsigned int predicted;
     unsigned int current = get_prediction(info.displayID, &predicted) ? predicted : info.currentIndex;
-    unsigned int target = (direction == ISSDirectionLeft) ? current - 1 : current + 1;
-
-    CGSSpaceID targetSpaceID = 0;
-    if ((CFIndex)target < CFArrayGetCount(spaceIDs)) {
-        CFNumberRef boxed = (CFNumberRef)CFArrayGetValueAtIndex(spaceIDs, (CFIndex)target);
-        if (boxed) {
-            CFNumberGetValue(boxed, kCFNumberSInt64Type, &targetSpaceID);
-        }
-    }
-    CFRelease(spaceIDs);
-
-    if (targetSpaceID == 0) {
-        fprintf(stderr, "ISS: iss_switch_and_follow: no target space id for index %u\n", target);
-        return false;
-    }
-    SLSMoveWindowsFn slsMove = resolve_sls_move_windows();
-    if ((slsMove == NULL && &CGSMoveWindowsToManagedSpace == NULL) ||
-        &CGSMainConnectionID == NULL) {
-        fprintf(stderr, "ISS: iss_switch_and_follow: move-window symbol unavailable\n");
-        return false;
-    }
+    unsigned int targetZeroBased = (direction == ISSDirectionLeft) ? current - 1 : current + 1;
+    unsigned int targetOneBased = targetZeroBased + 1;
+    fprintf(stderr, "ISS:   current=%u target=%u (1-based=%u)\n",
+            current, targetZeroBased, targetOneBased);
 
     CGWindowID wid = 0;
-    if (!iss_get_focused_window_id(&wid)) {
-        fprintf(stderr, "ISS: iss_switch_and_follow: no movable focused window\n");
+    CGPoint grab = {0, 0};
+    AXUIElementRef axWin = NULL;
+    if (!iss_get_focused_window_and_grab_point(&wid, &grab, &axWin)) {
+        fprintf(stderr, "ISS:   no movable focused window; aborting\n");
         return false;
     }
 
-    CFArrayRef windowList = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionIncludingWindow, wid);
+    // Log the window owner for debugging.
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, wid);
     const char *ownerDesc = "?";
     char ownerBuf[256];
     if (windowList && CFArrayGetCount(windowList) > 0) {
@@ -771,36 +1005,107 @@ bool iss_switch_and_follow(ISSDirection direction) {
             ownerDesc = ownerBuf;
         }
     }
-    CGSConnectionID cid = CGSMainConnectionID();
-    fprintf(stderr, "ISS:   cid=%d window id=%u owner=%s target space id=%llu\n",
-            (int)cid, wid, ownerDesc, (unsigned long long)targetSpaceID);
+    fprintf(stderr, "ISS:   window id=%u owner=%s grab=(%.1f, %.1f)\n",
+            wid, ownerDesc, grab.x, grab.y);
     if (windowList) CFRelease(windowList);
 
-    CFNumberRef widNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &wid);
-    if (!widNum) {
+    // Build the four drag-sequence events.
+    CGEventRef mv   = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved,       grab, kCGMouseButtonLeft);
+    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown,    grab, kCGMouseButtonLeft);
+    CGEventRef drag = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDragged, grab, kCGMouseButtonLeft);
+    CGEventRef up   = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp,      grab, kCGMouseButtonLeft);
+    if (!mv || !down || !drag || !up) {
+        fprintf(stderr, "ISS:   CGEventCreate failed\n");
+        if (mv) CFRelease(mv);
+        if (down) CFRelease(down);
+        if (drag) CFRelease(drag);
+        if (up) CFRelease(up);
+        if (axWin) CFRelease(axWin);
         return false;
     }
-    const void *values[1] = { widNum };
-    CFArrayRef wids = CFArrayCreate(NULL, values, 1, &kCFTypeArrayCallBacks);
-    CFRelease(widNum);
-    if (!wids) {
-        return false;
-    }
-    if (slsMove != NULL) {
-        fprintf(stderr, "ISS:   calling SLSMoveWindowsToManagedSpace\n");
-        slsMove(cid, wids, targetSpaceID);
-    } else {
-        fprintf(stderr, "ISS:   calling CGSMoveWindowsToManagedSpace\n");
-        CGSMoveWindowsToManagedSpace(cid, wids, targetSpaceID);
-    }
-    CFRelease(wids);
+    CGEventSetFlags(mv, 0);
+    CGEventSetFlags(down, 0);
+    CGEventSetFlags(drag, 0);
+    CGEventSetFlags(up, 0);
 
-    if (!iss_switch_with_info(&info, direction)) {
-        return false;
+    fprintf(stderr, "ISS:   posting mouse-move/down/drag\n");
+    CGEventPost(kCGHIDEventTap, mv);
+    CGEventPost(kCGHIDEventTap, down);
+    CGEventPost(kCGHIDEventTap, drag);
+
+    // Give WindowServer a tick to register the drag as active.
+    usleep(10 * 1000);
+
+    // Fire the built-in Space-switch keyboard shortcut. This commits
+    // WindowServer to the "carry dragged window across Spaces" state machine.
+    fprintf(stderr, "ISS:   posting symbolic hotkey for desktop %u\n", targetOneBased);
+    bool switched = iss_post_switch_to_desktop_hotkey(targetOneBased);
+
+    // Empirically: posting a dock-swipe here does NOT interrupt the Space-slide
+    // animation — WindowServer is already committed to the slide initiated by
+    // the symbolic hotkey. The animation is a hard floor (~250 ms on Apple
+    // Silicon) for this carry-by-drag technique. Raycast and Amethyst hit the
+    // same wall.
+
+    // 20 ms settle. Dropping below this risks WindowServer canceling the move
+    // if mouse-up fires before the drag-carry commits.
+    usleep(20 * 1000);
+
+    fprintf(stderr, "ISS:   posting mouse-up (release drag)\n");
+    CGEventPost(kCGHIDEventTap, up);
+
+    // Re-focus the moved window. Two passes:
+    //   Immediate: quick feedback if macOS hasn't restored focus yet.
+    //   Delayed (~300 ms): safety net that fires AFTER macOS's space-focus
+    //   restoration kicks in, so we win the race. Without this, focus
+    //   intermittently lands on whatever was previously frontmost on the
+    //   target Space.
+    if (axWin) {
+        pid_t winPid = 0;
+        if (AXUIElementGetPid(axWin, &winPid) == kAXErrorSuccess && winPid > 0) {
+            AXUIElementRef appEl = AXUIElementCreateApplication(winPid);
+            if (appEl) {
+                (void)AXUIElementSetAttributeValue(appEl,
+                    kAXFrontmostAttribute, kCFBooleanTrue);
+                CFRelease(appEl);
+            }
+        }
+        (void)AXUIElementPerformAction(axWin, kAXRaiseAction);
+
+        // Retain axWin for the delayed block; transfer ownership to block.
+        AXUIElementRef pinnedAx = (AXUIElementRef)CFRetain(axWin);
+        CFRelease(axWin);
+        axWin = NULL;
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            pid_t pid = 0;
+            if (AXUIElementGetPid(pinnedAx, &pid) == kAXErrorSuccess && pid > 0) {
+                AXUIElementRef appEl = AXUIElementCreateApplication(pid);
+                if (appEl) {
+                    (void)AXUIElementSetAttributeValue(appEl,
+                        kAXFrontmostAttribute, kCFBooleanTrue);
+                    CFRelease(appEl);
+                }
+            }
+            AXError raiseErr = AXUIElementPerformAction(pinnedAx, kAXRaiseAction);
+            if (raiseErr != kAXErrorSuccess) {
+                fprintf(stderr, "ISS:   delayed AXRaise returned %d\n", (int)raiseErr);
+            }
+            CFRelease(pinnedAx);
+        });
     }
-    set_prediction(info.displayID, target);
-    if (switchCallback) { switchCallback(target); }
-    return true;
+
+    CFRelease(mv);
+    CFRelease(down);
+    CFRelease(drag);
+    CFRelease(up);
+
+    if (switched) {
+        set_prediction(info.displayID, targetZeroBased);
+        if (switchCallback) { switchCallback(targetZeroBased); }
+    }
+    return switched;
 }
 
 bool iss_switch_to_index(unsigned int targetIndex) {
