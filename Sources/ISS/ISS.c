@@ -9,8 +9,10 @@
 #include <float.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <mach/mach_time.h>
 
 static const CGEventField kCGSEventTypeField = (CGEventField)55;
 static const CGEventField kCGEventGestureHIDType = (CGEventField)110;
@@ -691,6 +693,31 @@ bool iss_switch(ISSDirection direction) {
 //   - axWindow (optional, owned by caller; released with CFRelease): the
 //     AXUIElement reference so the caller can perform a re-raise after the
 //     move. Pass NULL if you don't need it.
+// Compute the title-bar grab point for a window with the given screen frame.
+//
+// Matches Raycast's WindowManagementService: a fixed offset of (+5, +20) from
+// the window's top-left. Because the Space switch happens between mouse-down
+// and mouse-up, the click never completes as a button press even if it lands
+// near the traffic lights — it engages a window drag instead. Empirically this
+// is the point that makes AX-hostile apps (Spotify) hand the drag to
+// WindowServer.
+//
+// Env overrides for tuning via ISSCli:
+//   ISS_GRAB_DX = grab x as pixels right of the left edge (default 5)
+//   ISS_GRAB_DY = grab y as pixels below the top edge     (default 20)
+static CGPoint iss_grab_point_for_frame(CGRect frame) {
+    double dx = 5.0, dy = 20.0;
+    const char *edx = getenv("ISS_GRAB_DX");
+    const char *edy = getenv("ISS_GRAB_DY");
+    if (edx && *edx) dx = atof(edx);
+    if (edy && *edy) dy = atof(edy);
+    CGPoint p = {
+        frame.origin.x + dx,
+        frame.origin.y + dy
+    };
+    return p;
+}
+
 // CGWindowList-based fallback for AX-hostile apps (Spotify, some Electron apps,
 // etc). Finds the frontmost on-screen non-ISS window on layer 0 and computes
 // the grab point from its CGWindow bounds. Returns false if no candidate.
@@ -724,10 +751,7 @@ static bool iss_find_frontmost_foreign_window_via_cg(CGWindowID *outID,
         CFNumberGetValue(widNum, kCFNumberIntType, &foundWid);
 
         *outID = (CGWindowID)foundWid;
-        // Left-biased grab: past traffic lights (~70 px) into empty title bar
-        // space, before most apps' custom controls (search bars, nav, etc.).
-        outGrabPoint->x = rect.origin.x + 100.0;
-        outGrabPoint->y = rect.origin.y + 3.0;
+        *outGrabPoint = iss_grab_point_for_frame(rect);
 
         // When system-wide AX failed (how we got here), the app may not be
         // truly frontmost from WindowServer's perspective. Pre-activate it
@@ -852,14 +876,12 @@ static bool iss_get_focused_window_and_grab_point(CGWindowID *outID,
         CFRelease(sizeVal);
     }
 
-    // Grab point: horizontal midpoint, 3px below the top edge. Matches
-    // Hammerspoon's 2026 drag-and-switch technique; avoids the traffic-light
-    // buttons on the left and works reliably across apps with unusual
-    // title-bar layouts.
-    CGPoint grab = {
-        winPos.x + winSize.width / 2.0,
-        winPos.y + 3.0
-    };
+    // Grab point: horizontal midpoint, a few px below the top edge. Avoids the
+    // traffic-light buttons on the left and works reliably across apps with
+    // unusual title-bar layouts. Shared with the CG-fallback path so both
+    // resolution strategies grab the same (most-draggable) region.
+    CGRect axFrame = { { winPos.x, winPos.y }, { winSize.width, winSize.height } };
+    CGPoint grab = iss_grab_point_for_frame(axFrame);
 
     *outID = wid;
     *outGrabPoint = grab;
@@ -1067,6 +1089,25 @@ static bool iss_post_switch_to_desktop_hotkey(unsigned int targetIndexOneBased) 
     return true;
 }
 
+// Bring the moved window's app back to the foreground after the carry, so
+// focus stays on it instead of whatever was previously frontmost on the target
+// Space. Activating by PID works even for AX-hostile windows (e.g. Spotify)
+// that have no AX handle; when an AX element is available we also raise that
+// specific window.
+static void iss_refocus_window(pid_t pid, AXUIElementRef axWin) {
+    if (pid > 0) {
+        AXUIElementRef appEl = AXUIElementCreateApplication(pid);
+        if (appEl) {
+            (void)AXUIElementSetAttributeValue(appEl,
+                kAXFrontmostAttribute, kCFBooleanTrue);
+            CFRelease(appEl);
+        }
+    }
+    if (axWin) {
+        (void)AXUIElementPerformAction(axWin, kAXRaiseAction);
+    }
+}
+
 // Moves the focused window to the adjacent Space and switches there using
 // Silica/Amethyst's technique: simulate a user-initiated drag on the window's
 // title bar, trigger the built-in "Switch to Desktop N" symbolic hotkey, then
@@ -1104,10 +1145,12 @@ bool iss_switch_and_follow(ISSDirection direction) {
         return false;
     }
 
-    // Log the window owner for debugging.
+    // Log the window owner, and capture its PID so we can re-focus the window
+    // after the carry even when it came through the AX-less CG fallback.
     CFArrayRef windowList = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, wid);
     const char *ownerDesc = "?";
     char ownerBuf[256];
+    pid_t winPid = 0;
     if (windowList && CFArrayGetCount(windowList) > 0) {
         CFDictionaryRef wi = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, 0);
         CFStringRef owner = (CFStringRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowOwnerName"));
@@ -1115,41 +1158,61 @@ bool iss_switch_and_follow(ISSDirection direction) {
             CFStringGetCString(owner, ownerBuf, sizeof(ownerBuf), kCFStringEncodingUTF8)) {
             ownerDesc = ownerBuf;
         }
+        CFNumberRef pidNum = (CFNumberRef)CFDictionaryGetValue(wi, CFSTR("kCGWindowOwnerPID"));
+        if (pidNum) {
+            int pidVal = 0;
+            CFNumberGetValue(pidNum, kCFNumberIntType, &pidVal);
+            winPid = (pid_t)pidVal;
+        }
+    }
+    // Fall back to the AX element's PID if the window list didn't yield one.
+    if (winPid <= 0 && axWin) {
+        (void)AXUIElementGetPid(axWin, &winPid);
     }
     fprintf(stderr, "ISS:   window id=%u owner=%s grab=(%.1f, %.1f)\n",
             wid, ownerDesc, grab.x, grab.y);
     if (windowList) CFRelease(windowList);
 
-    // Build the drag-sequence events with a real HID-backed event source.
-    // Source-less events (NULL source) are rejected by some apps (sandboxed
-    // Chromium); a HIDSystemState-backed source makes our events look like
-    // genuine HID input. All events share the grab point — zero motion keeps
-    // the window visually stationary while WindowServer's drag-across-Spaces
-    // state machine carries it.
-    CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    CGEventRef mv   = CGEventCreateMouseEvent(src, kCGEventMouseMoved,       grab, kCGMouseButtonLeft);
-    CGEventRef down = CGEventCreateMouseEvent(src, kCGEventLeftMouseDown,    grab, kCGMouseButtonLeft);
-    CGEventRef drag = CGEventCreateMouseEvent(src, kCGEventLeftMouseDragged, grab, kCGMouseButtonLeft);
-    CGEventRef up   = CGEventCreateMouseEvent(src, kCGEventLeftMouseUp,      grab, kCGMouseButtonLeft);
-    if (!mv || !down || !drag || !up) {
+    // Replicate Raycast's WindowManagementService.moveWindowWithMouseClick: a
+    // ZERO-MOTION synthetic click (LeftMouseDown + LeftMouseUp at the SAME
+    // title-bar point) with the Space switch held between them, so WindowServer
+    // carries the window across with NO displacement (the "drag" the user sees
+    // is the carry animation, not the window translating).
+    //
+    // Fidelity details that make AX-hostile apps (Spotify) hand the drag to
+    // WindowServer where a posted mouseMoved event does not:
+    //   * physically WARP the hardware cursor onto the title bar (and restore
+    //     it afterward) instead of synthesizing a mouseMoved event;
+    //   * use a PRIVATE event source (kCGEventSourceStatePrivate);
+    //   * stamp the events with increasing timestamps.
+    // (Electron apps — Claude, ChatGPT — still won't engage; even Raycast can't
+    // move them. That's the ceiling, not a bug here.)
+
+    // Remember the cursor location so we can put it back.
+    CGPoint savedCursor = grab;
+    CGEventRef probe = CGEventCreate(NULL);
+    if (probe) { savedCursor = CGEventGetLocation(probe); CFRelease(probe); }
+
+    CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStatePrivate);
+    CGEventRef down = CGEventCreateMouseEvent(src, kCGEventLeftMouseDown, grab, kCGMouseButtonLeft);
+    CGEventRef up   = CGEventCreateMouseEvent(src, kCGEventLeftMouseUp,   grab, kCGMouseButtonLeft);
+    if (!down || !up) {
         fprintf(stderr, "ISS:   CGEventCreate failed\n");
-        if (mv) CFRelease(mv);
         if (down) CFRelease(down);
-        if (drag) CFRelease(drag);
         if (up) CFRelease(up);
         if (src) CFRelease(src);
         if (axWin) CFRelease(axWin);
         return false;
     }
-    CGEventSetFlags(mv, 0);
     CGEventSetFlags(down, 0);
-    CGEventSetFlags(drag, 0);
     CGEventSetFlags(up, 0);
+    uint64_t ts = mach_absolute_time();
+    CGEventSetTimestamp(down, ts);
+    CGEventSetTimestamp(up, ts + 1);
 
-    fprintf(stderr, "ISS:   posting mouse-move/down/drag\n");
-    CGEventPost(kCGHIDEventTap, mv);
+    fprintf(stderr, "ISS:   warp cursor + LeftMouseDown at (%.0f, %.0f)\n", grab.x, grab.y);
+    CGWarpMouseCursorPosition(grab);
     CGEventPost(kCGHIDEventTap, down);
-    CGEventPost(kCGHIDEventTap, drag);
 
     // Give WindowServer a tick to register the drag as active.
     usleep(10 * 1000);
@@ -1159,64 +1222,36 @@ bool iss_switch_and_follow(ISSDirection direction) {
     fprintf(stderr, "ISS:   posting symbolic hotkey for desktop %u\n", targetOneBased);
     bool switched = iss_post_switch_to_desktop_hotkey(targetOneBased);
 
-    // Empirically: posting a dock-swipe here does NOT interrupt the Space-slide
-    // animation — WindowServer is already committed to the slide initiated by
-    // the symbolic hotkey. The animation is a hard floor (~250 ms on Apple
-    // Silicon) for this carry-by-drag technique. Raycast and Amethyst hit the
-    // same wall.
-
     // 20 ms settle. Dropping below this risks WindowServer canceling the move
     // if mouse-up fires before the drag-carry commits.
     usleep(20 * 1000);
 
-    fprintf(stderr, "ISS:   posting mouse-up (release drag)\n");
+    fprintf(stderr, "ISS:   LeftMouseUp + restore cursor\n");
     CGEventPost(kCGHIDEventTap, up);
+    CGWarpMouseCursorPosition(savedCursor);
 
-    // Re-focus the moved window. Two passes:
+    // Re-focus the moved window so focus stays on it rather than whatever was
+    // previously frontmost on the target Space (e.g. Chrome). Two passes:
     //   Immediate: quick feedback if macOS hasn't restored focus yet.
     //   Delayed (~300 ms): safety net that fires AFTER macOS's space-focus
-    //   restoration kicks in, so we win the race. Without this, focus
-    //   intermittently lands on whatever was previously frontmost on the
-    //   target Space.
-    if (axWin) {
-        pid_t winPid = 0;
-        if (AXUIElementGetPid(axWin, &winPid) == kAXErrorSuccess && winPid > 0) {
-            AXUIElementRef appEl = AXUIElementCreateApplication(winPid);
-            if (appEl) {
-                (void)AXUIElementSetAttributeValue(appEl,
-                    kAXFrontmostAttribute, kCFBooleanTrue);
-                CFRelease(appEl);
-            }
-        }
-        (void)AXUIElementPerformAction(axWin, kAXRaiseAction);
+    //   restoration kicks in, so we win the race.
+    // Activating by PID covers AX-hostile windows (Spotify) that reach here via
+    // the CG fallback with no AX handle; an AX element, when present, also lets
+    // us raise the specific window.
+    if (winPid > 0 || axWin) {
+        AXUIElementRef pinnedAx = axWin ? (AXUIElementRef)CFRetain(axWin) : NULL;
+        if (axWin) { CFRelease(axWin); axWin = NULL; }
 
-        // Retain axWin for the delayed block; transfer ownership to block.
-        AXUIElementRef pinnedAx = (AXUIElementRef)CFRetain(axWin);
-        CFRelease(axWin);
-        axWin = NULL;
+        iss_refocus_window(winPid, pinnedAx);
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            pid_t pid = 0;
-            if (AXUIElementGetPid(pinnedAx, &pid) == kAXErrorSuccess && pid > 0) {
-                AXUIElementRef appEl = AXUIElementCreateApplication(pid);
-                if (appEl) {
-                    (void)AXUIElementSetAttributeValue(appEl,
-                        kAXFrontmostAttribute, kCFBooleanTrue);
-                    CFRelease(appEl);
-                }
-            }
-            AXError raiseErr = AXUIElementPerformAction(pinnedAx, kAXRaiseAction);
-            if (raiseErr != kAXErrorSuccess) {
-                fprintf(stderr, "ISS:   delayed AXRaise returned %d\n", (int)raiseErr);
-            }
-            CFRelease(pinnedAx);
+            iss_refocus_window(winPid, pinnedAx);
+            if (pinnedAx) CFRelease(pinnedAx);
         });
     }
 
-    CFRelease(mv);
     CFRelease(down);
-    CFRelease(drag);
     CFRelease(up);
     if (src) CFRelease(src);
 
