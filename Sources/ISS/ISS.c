@@ -1089,6 +1089,22 @@ static bool iss_post_switch_to_desktop_hotkey(unsigned int targetIndexOneBased) 
     return true;
 }
 
+// Returns the CGSSpaceID of the window's first Space, or 0 if unknown. Used to
+// tell whether a carry actually relocated the window.
+static CGSSpaceID iss_window_primary_space(CGSConnectionID cid, CGWindowID wid) {
+    if (!cid) return 0;
+    CFArrayRef spaces = iss_copy_spaces_for_window(cid, wid);
+    CGSSpaceID out = 0;
+    if (spaces) {
+        if (CFArrayGetCount(spaces) > 0) {
+            CFNumberGetValue((CFNumberRef)CFArrayGetValueAtIndex(spaces, 0),
+                             kCFNumberSInt64Type, &out);
+        }
+        CFRelease(spaces);
+    }
+    return out;
+}
+
 // Bring the moved window's app back to the foreground after the carry, so
 // focus stays on it instead of whatever was previously frontmost on the target
 // Space. Activating by PID works even for AX-hostile windows (e.g. Spotify)
@@ -1173,6 +1189,11 @@ bool iss_switch_and_follow(ISSDirection direction) {
             wid, ownerDesc, grab.x, grab.y);
     if (windowList) CFRelease(windowList);
 
+    // Snapshot the window's current Space so we can tell afterward whether the
+    // carry actually relocated it.
+    CGSConnectionID cid = (&CGSMainConnectionID != NULL) ? CGSMainConnectionID() : 0;
+    CGSSpaceID sourceWinSpace = iss_window_primary_space(cid, wid);
+
     // Replicate Raycast's WindowManagementService.moveWindowWithMouseClick: a
     // ZERO-MOTION synthetic click (LeftMouseDown + LeftMouseUp at the SAME
     // title-bar point) with the Space switch held between them, so WindowServer
@@ -1230,14 +1251,50 @@ bool iss_switch_and_follow(ISSDirection direction) {
     CGEventPost(kCGHIDEventTap, up);
     CGWarpMouseCursorPosition(savedCursor);
 
-    // Re-focus the moved window so focus stays on it rather than whatever was
-    // previously frontmost on the target Space (e.g. Chrome). Two passes:
-    //   Immediate: quick feedback if macOS hasn't restored focus yet.
-    //   Delayed (~300 ms): safety net that fires AFTER macOS's space-focus
-    //   restoration kicks in, so we win the race.
-    // Activating by PID covers AX-hostile windows (Spotify) that reach here via
-    // the CG fallback with no AX handle; an AX element, when present, also lets
-    // us raise the specific window.
+    CFRelease(down);
+    CFRelease(up);
+    if (src) CFRelease(src);
+
+    // Did the window actually carry to the new Space? Apps that won't engage
+    // the drag (Electron — Claude, ChatGPT) leave it behind on the source Space
+    // even though the Space still switched. Detect that by checking whether the
+    // window's Space changed.
+    bool carried = false;
+    CGSSpaceID nowWinSpace = sourceWinSpace;
+    if (switched) {
+        // Poll for the window's Space to change. A real carry commits within a
+        // few ms, so this exits fast; only a genuinely stuck window (Electron)
+        // waits out the full ~200 ms before we conclude it didn't move. Polling
+        // (rather than a single delayed read) avoids a false negative that
+        // would wrongly revert a successful move.
+        for (int i = 0; i < 10 && !carried; i++) {
+            usleep(20 * 1000);
+            nowWinSpace = iss_window_primary_space(cid, wid);
+            carried = (nowWinSpace != 0 && nowWinSpace != sourceWinSpace);
+        }
+        fprintf(stderr, "ISS:   carried=%d (window space %llu -> %llu)\n",
+                carried ? 1 : 0,
+                (unsigned long long)sourceWinSpace, (unsigned long long)nowWinSpace);
+    }
+
+    if (switched && !carried) {
+        // The window stayed behind. Undo the Space switch and do NOT re-focus
+        // (re-focusing would just yank the viewport back to the source Space).
+        // Net effect: a clean return to where we started instead of a janky
+        // forward+snap-back. Returning false makes the app beep — signaling the
+        // move wasn't supported for this window.
+        fprintf(stderr, "ISS:   no carry — reverting to source desktop %u\n", current + 1);
+        iss_post_switch_to_desktop_hotkey(current + 1);
+        if (axWin) CFRelease(axWin);
+        set_prediction(info.displayID, current);
+        return false;
+    }
+
+    // Carried: re-focus the moved window so focus stays on it rather than
+    // whatever was previously frontmost on the target Space (e.g. Chrome). Two
+    // passes — immediate, then delayed ~300 ms to win the race against macOS's
+    // own space-focus restoration. Activating by PID covers AX-hostile windows
+    // (Spotify) with no AX handle; an AX element also lets us raise the window.
     if (winPid > 0 || axWin) {
         AXUIElementRef pinnedAx = axWin ? (AXUIElementRef)CFRetain(axWin) : NULL;
         if (axWin) { CFRelease(axWin); axWin = NULL; }
@@ -1250,10 +1307,6 @@ bool iss_switch_and_follow(ISSDirection direction) {
             if (pinnedAx) CFRelease(pinnedAx);
         });
     }
-
-    CFRelease(down);
-    CFRelease(up);
-    if (src) CFRelease(src);
 
     if (switched) {
         set_prediction(info.displayID, targetZeroBased);
